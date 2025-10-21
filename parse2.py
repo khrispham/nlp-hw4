@@ -13,11 +13,12 @@ import argparse
 import logging
 import math
 import tqdm
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from collections import Counter
-from typing import Counter as CounterType, Iterable, List, Optional, Dict, Tuple
+from collections import defaultdict
+from typing import Counter as CounterType, Iterable, List, Optional, Dict, Tuple, Set
+
 
 
 log = logging.getLogger(Path(__file__).stem)  # For usage, see findsim.py in earlier assignment.
@@ -62,17 +63,21 @@ def parse_args() -> argparse.Namespace:
 class EarleyChart:
     """A chart for Earley's algorithm."""
     
-    def __init__(self, tokens: List[str], grammar: Grammar, progress: bool = False, maxcost: float = math.inf) -> None:
+    def __init__(self, tokens: List[str], grammar: Grammar, progress: bool = False) -> None:
         """Create the chart based on parsing `tokens` with `grammar`.  
         `progress` says whether to display progress bars as we parse."""
         self.tokens = tokens
         self.grammar = grammar
         self.progress = progress
-        self.maxcost = maxcost
         self.profile: CounterType[str] = Counter()
 
+        # --- E.2 vocab set for quick filtering (needed by _predict) ---
+        self._sent_vocab: Set[str] = set(tokens)
+        # --- end E.2 ---
+
+
         # Augmented start
-        #self._aug = "__START__"
+        self._aug = "__START__"
 
 
         # cost of each entry in the chart
@@ -85,43 +90,44 @@ class EarleyChart:
         # best full cost for a completed constituent
         self.best_complete: Dict[Tuple[str, int, int], float] = {}
 
-
-
-
         self.cols: List[Agenda]
+
+        # --- E.2 Vocabulary specialization: per-sentence active rule set ---
+        # Temporarily "delete" rules that contain terminals not appearing in this sentence.
+        self._expansions_active: Dict[str, List[Rule]] = self.grammar.specialize_to_sentence(self.tokens)
+        # --- end E.2 ---
+
+        # --- E.6: placeholder for per-column S_j (filled in _run_earley) ---
+        self._S_per_col: List[Optional[Dict[str, Set[str]]]] = []
+        # --- end E.6 ---
+
+
+
         self._run_earley()    # run Earley's algorithm to construct self.cols
 
     # check final column for best parse (else return None)
     def best_root_item(self) -> Optional[Tuple[Item, float]]:
         n = len(self.tokens)
-        best_item = None
+        best_aug = None
         best_cost = None
         for item in self.cols[-1].all():
-            if (item.rule.lhs == self.grammar.start_symbol and
-                item.next_symbol() is None and
-                item.start_position == 0):
-                full = self.cost[(item, n)] + item.rule.weight
+            if item.rule.lhs == self._aug and item.next_symbol() is None and item.start_position == 0:
+                full = self.cost[(item, n)] + item.rule.weight 
                 if best_cost is None or full < best_cost - 1e-12:
                     best_cost = full
-                    best_item = item
-        return None if best_item is None else (best_item, best_cost)
+                    best_aug = item
+        if best_aug is None:
+            return None
+        bp = self.bp_attach.get((best_aug, n))
+        if bp is None:
+            return None
+        # match return format
+        _, (root_child, _) = bp
 
-    # Optimization: left corner filtering
-    def _compute_start_set(self, word: str) -> Dict[str, set[str]]:
-        """Compute the left-corner start set for word w_j."""
-        start_set: Dict[str, set[str]] = {}
-        stack = [word]
-        visited = set([word])
+        # Return the completed ROOT item with same full cost
+        return (root_child, best_cost)
 
-        # Recursive DFS: for each Y, add Y to start_set(X) for every X in P(Y)
-        while stack:
-            Y = stack.pop()
-            for X in self.grammar.left_parent.get(Y, []):
-                start_set.setdefault(X, set()).add(Y)
-                if X not in visited:
-                    visited.add(X)
-                    stack.append(X)
-        return start_set
+
 
 
 
@@ -164,37 +170,16 @@ class EarleyChart:
         return False   # we didn't find any appropriate item
 
     def _update_item(self, col_index: int, item: Item, cand_cost: float) -> None:
-        """Insert or improve an item's score for this column, always ensure it's enqueued in this column."""
+        """Insert or improve an item's score for this column; always ensure it's enqueued in this column."""
         key = (item, col_index)
         prev = self.cost.get(key)
-        min_improve = 1e-6
-
-        # --- Iterative deepening / Rehypothesis ---
-        # If we previously skipped this item because its cost exceeded the old maxcost,
-        # but the current maxcost is now higher, re-enqueue it for reconsideration.
-        if cand_cost > self.maxcost:
-            # Store it for later reprocessing
-            self._deferred = getattr(self, "_deferred", {})
-            old = self._deferred.get(key)
-            if old is None or cand_cost < old - min_improve:
-                self._deferred[key] = cand_cost
-            return
-
-        # --- Normal path ---
-        existing = any(
-            it.rule == item.rule and it.dot_position == item.dot_position
-            and it.start_position == item.start_position
-            for it in self.cols[col_index]._items[self.cols[col_index]._next:]
-        )
-        if existing:
-            return
-
+        # Always ensure it's present in this column's agenda
         self.cols[col_index].push(item)
-        if prev is None or cand_cost < prev - min_improve:
+        if prev is None or cand_cost < prev - 1e-12:
             self.cost[key] = cand_cost
+            # If we improved an existing entry, requeue
             if prev is not None:
                 self.cols[col_index].requeue(item)
-
 
 
     def _finish_constituent(self, completed: Item, end_col: int) -> float:
@@ -207,27 +192,59 @@ class EarleyChart:
             self.best_complete[key_span] = full_cost
         return self.best_complete[key_span]
 
+    # --- E.6 Left-corner filtering: build S_j for column j ---
+    def _build_leftcorner_S(self, j: int) -> Dict[str, Set[str]]:
+        """
+        S_j(A) = {B : A in P(B) and B is a left ancestor of w_j }.
+        We compute by DFS starting from Y = w_j (the token at j).
+        """
+        S: Dict[str, Set[str]] = defaultdict(set)
+        seen: Set[str] = set()
+
+        # If j is at end of sentence, there is no w_j; return empty S_j
+        if j >= len(self.tokens):
+            return S
+
+        wj = self.tokens[j]
+
+        def process(Y: str) -> None:
+            if Y in seen:
+                return
+            seen.add(Y)
+            # For each left-parent X of Y, add and recurse upward
+            for X in self.grammar.P.get(Y, set()):
+                if Y not in S[X]:
+                    S[X].add(Y)
+                    process(X)
+
+        # Start from the terminal w_j
+        process(wj)
+        return S
+    # --- end E.6 ---
 
 
 
     def _run_earley(self) -> None:
-        """Fill in or continue filling in the Earley chart."""
-        if not hasattr(self, "cols"):  # first time only
-            self.cols = [Agenda() for _ in range(len(self.tokens) + 1)]
-            self.cost = {}
-            self.bp_scan = {}
-            self.bp_attach = {}
-            self.best_complete = {}
-            self.profile = Counter()
-            for rule in self.grammar.expansions(self.grammar.start_symbol):
-                start_item = Item(rule, 0, 0)
-                self.cost[(start_item, 0)] = 0.0
-                self.cols[0].push(start_item)
-        
-        # Optimization: space time constraint
-        start_time = time.time()
-        MAX_TIME = 30.0
-        MAX_COLUMN_SIZE = 10000
+        """Fill in the Earley chart."""
+        # Initially empty column for each position in sentence
+        self.cols = [Agenda() for _ in range(len(self.tokens) + 1)]
+
+        # --- E.1 Batch duplicate check: per-column sets ---
+        # For each column, remember which nonterminals we've already batch-predicted here.
+        # (Now it's safe because self.cols exists and has the final length.)
+        self._predicted_nonterminals: List[Set[str]] = [set() for _ in self.cols]
+        # --- end E.1 per-column sets ---
+
+        # --- E.6: pre-allocate S_j holder for all columns ---
+        self._S_per_col = [None] * len(self.cols)
+        # --- end E.6 ---
+
+
+        # Seed: S' → · ROOT at column 0 (weight 0)
+        aug_rule = Rule(self._aug, (self.grammar.start_symbol,), 0.0)
+        start_item = Item(aug_rule, 0, 0)
+        self.cost[(start_item, 0)] = 0.0
+        self.cols[0].push(start_item)
 
         # We'll go column by column, and within each column row by row.
         # Processing earlier entries in the column may extend the column
@@ -240,18 +257,11 @@ class EarleyChart:
                                    disable=not self.progress):
             log.debug("")
             log.debug(f"Processing items in column {i}")
+            # --- E.6: compute S_i once per column (depends only on w_i) ---
+            if self._S_per_col[i] is None:
+                self._S_per_col[i] = self._build_leftcorner_S(i)
+            # --- end E.6 ---
 
-            # Optimization: space time constraint
-            #if len(column._items) > MAX_COLUMN_SIZE:
-            #    log.warning(f"Column {i} too large ({len(column)} items), aborting.")
-            #    return
-            #if time.time() - start_time > MAX_TIME:
-            #    log.warning(f"Timeout reached at column {i}, aborting parse.")
-            #    return
-            
-            start_set = None
-            if i < len(self.tokens):  # no next word at last column
-                start_set = self._compute_start_set(self.tokens[i])
             while column:    # while agenda isn't empty
                 item = column.pop()   # dequeue the next unprocessed item
                 next = item.next_symbol()
@@ -262,66 +272,74 @@ class EarleyChart:
                 elif self.grammar.is_nonterminal(next):
                     # Predict the nonterminal after the dot
                     log.debug(f"{item} => PREDICT")
-                    self._predict(next, i, start_set)
+                    self._predict(next, i)
                 else:
                     # Try to scan the terminal after the dot
                     log.debug(f"{item} => SCAN")
-                    self._scan(item, i)
-        # --- Rehypothesize deferred items once maxcost increases ---
-        if hasattr(self, "_deferred") and self._deferred:
-            for (item, col_index), cand_cost in list(self._deferred.items()):
-                if cand_cost <= self.maxcost:
-                    self._update_item(col_index, item, cand_cost)
-                    del self._deferred[(item, col_index)]                     
+                    self._scan(item, i)                      
 
-    def _predict(self, nonterminal: str, position: int, start_set: Optional[Dict[str, set[str]]] = None) -> None:
-        """Predict new items for a nonterminal the given position."""
-        
-        predicted_here = getattr(self, "_predicted_here", None)
-        if predicted_here is None:
-            self._predicted_here = predicted_here = set()
-        key = (position, nonterminal)
-        if key in predicted_here:
+    # --- E.2 Vocabulary specialization: accessor for filtered expansions ---
+    def _expansions(self, lhs: str) -> Iterable["Rule"]:
+        return self._expansions_active.get(lhs, [])
+    # --- end E.2 ---
+
+
+    def _predict(self, nonterminal: str, position: int) -> None:
+        # --- E.1 Batch duplicate check ---
+        if nonterminal in self._predicted_nonterminals[position]:
+            self.profile["PREDICT_BATCH_SKIPPED"] += 1
             return
-        predicted_here.add(key)
+        self._predicted_nonterminals[position].add(nonterminal)
+        # --- end E.1 ---
 
-        # Optimization: Batch caching
-        key = (position, nonterminal)
-        if not hasattr(self, "_predict_cache"):
-            self._predict_cache: Dict[Tuple[int, str], List[Rule]] = {}
-        if key in self._predict_cache:
-            rules = self._predict_cache[key]
-        else:
-            rules = list(self.grammar.expansions(nonterminal))
-            self._predict_cache[key] = rules
+        # --- E.6 Left-corner filtering + E.2 Vocabulary specialization ---
+        Sj = self._S_per_col[position] or {}
+        Bs = Sj.get(nonterminal, set())
+        any_rule = False
 
-        # Optimization: Left-corner filtering
-        # If start_set is available, only predict if this nonterminal could lead to something
-        # consistent with the next word’s left-corner set.
-        allowed_Bs = None
-        if start_set is not None and nonterminal in start_set:
-            allowed_Bs = start_set[nonterminal]
+        # 1) Preferred path: LC-filtered predictions
+        for B in Bs:
+            for rule in self.grammar.R.get((nonterminal, B), []):
+                # E.2 filter: drop rule if it contains a terminal not in the sentence
+                ok = True
+                for sym in rule.rhs:
+                    if sym not in self.grammar._expansions and sym not in self._sent_vocab:
+                        ok = False
+                        break
+                if not ok:
+                    continue
 
-        # Optimization: word specialization
-        # delay predictions rather than pruning
-        if position < len(self.tokens):
-            word = self.tokens[position].lower()
-            if hasattr(self.grammar, "can_begin"):
-                # Only skip if the grammar definitely
-                #  cannot yield this word.
-                can = self.grammar.can_begin(nonterminal, word)
-                #if can is False:
-                #    return
+                any_rule = True
+                new_item = Item(rule, dot_position=0, start_position=position)
+                self._update_item(position, new_item, cand_cost=0.0)
+                log.debug(f"\tPredict(E.6+E.2): {new_item} via B={B} in column {position}")
+                self.profile["PREDICT_LC"] += 1
 
-        # predict
-        for rule in rules:
-            #if allowed_Bs is not None and rule.rhs:
-            #    if rule.rhs[0] not in allowed_Bs:
-            #        continue
-            new_item = Item(rule, dot_position=0, start_position=position)
-            self._update_item(position, new_item, cand_cost=0.0)
-            log.debug(f"\tPredicted: {new_item} in column {position}")
-            self.profile["PREDICT"] += 1
+        # Optional trick from the spec: after using S_j(A) once, empty it
+        if nonterminal in Sj:
+            Sj[nonterminal] = set()
+
+        # 2) Fallback: if LC contributed nothing, back off to all (E.2-specialized) expansions of A
+        if not any_rule:
+            # Using sentence-specialized expansions keeps E.2 intact.
+            backed_off = 0
+            for rule in self._expansions(nonterminal):
+                # (Rule set already E.2-filtered by specialize_to_sentence)
+                new_item = Item(rule, dot_position=0, start_position=position)
+                self._update_item(position, new_item, cand_cost=0.0)
+                log.debug(f"\tPredict(FALLBACK E.2): {new_item} in column {position}")
+                backed_off += 1
+
+            if backed_off:
+                self.profile["PREDICT_FALLBACK_USED"] += 1
+                any_rule = True
+            else:
+                self.profile["PREDICT_VOCAB_FILTER_SKIPPED"] += 1
+        # --- end E.6 + E.2 ---
+
+
+
+
 
 
     def _scan(self, item: Item, position: int) -> None:
@@ -342,29 +360,31 @@ class EarleyChart:
 
 
     def _attach(self, item: Item, position: int) -> None:
-        if not hasattr(self, "_completed_spans"):
-            self._completed_spans = set()
-        span_key = (item.rule.lhs, item.start_position, position)
-        if span_key in self._completed_spans:
-            return
-        self._completed_spans.add(span_key)
-
         mid = item.start_position
         child_full = self._finish_constituent(item, position)
 
-        for customer in self.cols[mid].all():
-            if customer.next_symbol() == item.rule.lhs:
-                new_item = customer.with_dot_advanced()
-                cand = self.cost.get((customer, mid), 0.0) + child_full
-                prev = self.cost.get((new_item, position))
-                self._update_item(position, new_item, cand)
-                if prev is None or cand < prev - 1e-12:
-                    self.bp_attach[(new_item, position)] = ((customer, mid), (item, position))
-                next = new_item.next_symbol()
-                if next is not None and self.grammar.is_nonterminal(next):
-                    self._predict(next, position)
-                log.debug(f"\tAttached to get: {new_item} in column {position}")
-                self.profile["ATTACH"] += 1
+        # Fast path (E.5): only customers expecting this child's LHS
+        customers = list(self.cols[mid].customers_of(item.rule.lhs))
+
+        # Fallback to preserve completeness if index is empty
+        if not customers:
+            self.profile["ATTACH_CUSTOMER_FALLBACK"] += 1
+            customers = [c for c in self.cols[mid].all()
+                        if getattr(c, "next_symbol", lambda: None)() == item.rule.lhs]
+
+        for customer in customers:
+            new_item = customer.with_dot_advanced()
+            cand = self.cost.get((customer, mid), 0.0) + child_full
+            prev = self.cost.get((new_item, position))
+            self._update_item(position, new_item, cand)
+            if prev is None or cand < prev - 1e-12:
+                self.bp_attach[(new_item, position)] = ((customer, mid), (item, position))
+            nxt = new_item.next_symbol()
+            if nxt is not None and self.grammar.is_nonterminal(nxt):
+                self._predict(nxt, position)
+            log.debug(f"\tAttached to get: {new_item} in column {position}")
+            self.profile["ATTACH"] += 1
+
 
 
 
@@ -425,44 +445,54 @@ class Agenda:
         # this design to store weights and backpointers.  That additional information could be
         # stored either in self._items or in self._index.
 
+        # --- E.5 customer index: next-symbol -> items expecting it ---
+        from collections import defaultdict
+        self._by_next: Dict[str, List[Item]] = defaultdict(list)
+        # --- end E.5 ---
+
     def __len__(self) -> int:
-        """Returns number of items that are still waiting to be popped.
-        Enables `len(my_agenda)`."""
         return len(self._items) - self._next
     
     def __bool__(self) -> bool:
         return len(self) > 0
 
+    # --- E.5: fast lookup of customers expecting X in this column ---
+    def customers_of(self, symbol: str) -> Iterable[Item]:
+        return self._by_next.get(symbol, ())
+    # --- end E.5 ---
 
     def push(self, item: Item) -> None:
-        """Add (enqueue) the item, unless it was previously added."""
-        if item not in self._index:    # O(1) lookup in hash table
+        """Enqueue unless seen before; also index by next symbol (E.5) if available."""
+        if item not in self._index:
             self._items.append(item)
             self._index[item] = len(self._items) - 1
-            
+
+            # E.5 (robust): only index if the object exposes next_symbol()
+            next_fn = getattr(item, "next_symbol", None)
+            if callable(next_fn):
+                nxt = next_fn()
+                if nxt is not None:
+                    self._by_next[nxt].append(item)
+
+
     def pop(self) -> Item:
-        """Returns one of the items that was waiting to be popped (dequeued).
-        Raises IndexError if there are no items waiting."""
-        if len(self)==0:
+        if len(self) == 0:
             raise IndexError
         item = self._items[self._next]
         self._next += 1
         return item
 
     def requeue(self, item: Item) -> None:
-        """Force re-processing when an item's score improves (allow a duplicate in the queue)."""
+        """Allow reprocessing when an item's score improves."""
         self._items.append(item)
 
-
     def all(self) -> Iterable[Item]:
-        """Collection of all items that have ever been pushed, even if 
-        they've already been popped."""
         return self._items
 
     def __repr__(self):
-        """Provide a human-readable string REPResentation of this Agenda."""
         next = self._next
         return f"{self.__class__.__name__}({self._items[:next]}; {self._items[next:]})"
+
 
 class Grammar:
     """Represents a weighted context-free grammar."""
@@ -471,159 +501,18 @@ class Grammar:
         adding rules from the specified files if any."""
         self.start_symbol = start_symbol
         self._expansions: Dict[str, List[Rule]] = {}    # maps each LHS to the list of rules that expand it
+        
+        # --- E.6 Left-corner filtering: prefix & left-parent tables ---
+        # R(A,B): rules of the form A -> B ...
+        self.R: Dict[Tuple[str, str], List[Rule]] = {}
+        # P(B): set of A such that A -> B ...
+        self.P: Dict[str, Set[str]] = {}
+        # --- end E.6 ---
+
+        
         # Read the input grammar files
         for file in files:
             self.add_rules_from_file(file)
-
-        # Optimization: left-corner filtering
-        self.prefix: Dict[Tuple[str, str], List[Rule]] = {}      # prefix(A, B) = rules A → B …
-        self.left_parent: Dict[str, set[str]] = {}               # left_parent(B) = all A such that A → B …
-
-
-        for lhs, rules in self._expansions.items():
-            for rule in rules:
-                if not rule.rhs:  # skip empty right-hand sides
-                    continue
-                B = rule.rhs[0]
-                self.prefix.setdefault((lhs, B), []).append(rule) 
-                self.left_parent.setdefault(B, set()).add(lhs)
-
-        # Grammar optimizations
-        self.compute_yield_vocab()
-        self.compute_can_begin()
-        self.collapse_unary()
-
-    def compute_can_begin(self) -> None:
-        """Precompute which terminals each nonterminal can yield at its left edge."""
-        self.can_begin_table: Dict[str, set[str]] = {}
-        for lhs, rules in self._expansions.items():
-            starts = set()
-            for rule in rules:
-                if not rule.rhs:
-                    continue
-                first = rule.rhs[0]
-                if not self.is_nonterminal(first):
-                    starts.add(first.lower())
-                else:
-                    starts.update(self._yield_vocab.get(first, set()))
-            self.can_begin_table[lhs] = starts
-
-    def can_begin(self, lhs: str, word: str) -> bool:
-        """Return True iff lhs can ultimately yield this terminal (case-insensitive)."""
-        table = self.can_begin_table.get(lhs)
-        if table is None:
-            return True  # unknown lhs → be permissive
-        if not table:
-            return True  # empty set → unknown, not proven impossible
-        return word.lower() in table
-
-    def collapse_unary(self):
-        """Pre-collapse unary rules to reduce prediction depth."""
-        unary = {lhs: [r.rhs[0] for r in rules if len(r.rhs) == 1 and self.is_nonterminal(r.rhs[0])]
-                for lhs, rules in self._expansions.items()}
-        for lhs in list(unary.keys()):
-            closure = set()
-            stack = list(unary[lhs])
-            while stack:
-                x = stack.pop()
-                if x in closure: continue
-                closure.add(x)
-                stack.extend(unary.get(x, []))
-            for z in closure:
-                if z != lhs:
-                    self._expansions[lhs].append(Rule(lhs, (z,), 0.0))
-        # --- Ensure ROOT still has a path to S after collapsing ---
-        if "ROOT" in self._expansions and not any("S" in r.rhs for r in self._expansions["ROOT"]):
-            self._expansions["ROOT"].append(Rule("ROOT", ("S",), 0.0))
-
-
-
-
-    # Optimization: vocab specialization
-    def specialize(self, tokens: List[str]) -> "Grammar":
-        """
-        Return a specialized copy of this Grammar that omits lexical rules
-        unrelated to the current sentence's tokens.
-        """
-
-        # --- Create a shallow Grammar clone WITHOUT re-calling __init__ ---
-        specialized = Grammar.__new__(Grammar)
-        specialized.start_symbol = self.start_symbol
-        specialized._expansions = {}
-
-        # Build a lowercase lookup set for tokens
-        token_set = {t.lower() for t in tokens}
-
-        # Copy or filter rules
-        for lhs, rules in self._expansions.items():
-            for rule in rules:
-                rhs = rule.rhs
-                # Keep lexical rules only if their terminal matches the sentence
-                if all(sym not in self._expansions for sym in rhs):
-                    if any(sym.lower() in token_set for sym in rhs):
-                        specialized._expansions.setdefault(lhs, []).append(rule)
-                else:
-                    specialized._expansions.setdefault(lhs, []).append(rule)
-
-        # Always preserve start symbol rules
-        if self.start_symbol not in specialized._expansions and self.start_symbol in self._expansions:
-            specialized._expansions[self.start_symbol] = self._expansions[self.start_symbol]
-
-        # Rebuild optimization indices
-        specialized.prefix = {}
-        specialized.left_parent = {}
-        for lhs, rules in specialized._expansions.items():
-            for rule in rules:
-                if not rule.rhs:
-                    continue
-                B = rule.rhs[0]
-                specialized.prefix.setdefault((lhs, B), []).append(rule)
-                specialized.left_parent.setdefault(B, set()).add(lhs)
-
-        # --- REBUILD cached tables manually ---
-        specialized._yield_vocab = {}
-        specialized._nullable = set()
-        specialized.compute_yield_vocab()
-        specialized.compute_can_begin()
-        specialized.collapse_unary()
-
-        return specialized
-
-
-    # Optimization: vocab specialization
-    def compute_yield_vocab(self) -> None:
-        """Precompute the set of terminal symbols that each nonterminal can eventually produce."""
-        self._yield_vocab: Dict[str, set[str]] = {lhs: set() for lhs in self._expansions}
-
-        # Initialize with direct terminals
-        changed = True
-        while changed:
-            changed = False
-            for lhs, rules in self._expansions.items():
-                before = len(self._yield_vocab[lhs])
-                for rule in rules:
-                    for sym in rule.rhs:
-                        if sym not in self._expansions:  # terminal
-                            self._yield_vocab[lhs].add(sym.lower())
-                        else:
-                            self._yield_vocab[lhs].update(self._yield_vocab[sym])
-                if len(self._yield_vocab[lhs]) > before:
-                    changed = True
-
-        self._nullable: set[str] = set()
-
-        # Compute nullable symbols
-        changed = True
-        while changed:
-            changed = False
-            for lhs, rules in self._expansions.items():
-                for rule in rules:
-                    if all(sym in self._nullable or sym not in self._expansions for sym in rule.rhs):
-                        if lhs not in self._nullable:
-                            self._nullable.add(lhs)
-                            changed = True
-
-
 
     def add_rules_from_file(self, file: Path) -> None:
         """Add rules to this grammar from a file (one rule per line).
@@ -645,6 +534,18 @@ class Grammar:
                     self._expansions[lhs] = []
                 self._expansions[lhs].append(rule)
 
+                # --- E.6 Left-corner filtering: update R and P ---
+                if len(rhs) > 0:
+                    B = rhs[0]
+                    key = (lhs, B)
+                    # Add A to P(B) iff R(A,B) is currently empty (avoid dupes)
+                    if key not in self.R:
+                        self.R[key] = []
+                        self.P.setdefault(B, set()).add(lhs)
+                    self.R[key].append(rule)
+                # --- end E.6 ---
+
+
     def expansions(self, lhs: str) -> Iterable[Rule]:
         """Return an iterable collection of all rules with a given lhs"""
         return self._expansions[lhs]
@@ -652,6 +553,34 @@ class Grammar:
     def is_nonterminal(self, symbol: str) -> bool:
         """Is symbol a nonterminal symbol?"""
         return symbol in self._expansions
+    
+    # --- E.2 Vocabulary specialization: build per-sentence filtered expansions ---
+    def specialize_to_sentence(self, tokens: List[str]) -> Dict[str, List["Rule"]]:
+        """
+        Return a mapping {lhs -> [Rule, ...]} where any rule that mentions a terminal
+        not present in `tokens` is removed. (Nonterminals are kept.)
+        """
+        vocab = set(tokens)
+        filtered: Dict[str, List[Rule]] = {}
+
+        for lhs, rules in self._expansions.items():
+            kept = []
+            for r in rules:
+                ok = True
+                for sym in r.rhs:
+                    # A terminal is any symbol that is not a known nonterminal in this grammar
+                    if sym not in self._expansions:   # terminal
+                        if sym not in vocab:
+                            ok = False
+                            break
+                if ok:
+                    kept.append(r)
+            filtered[lhs] = kept
+        return filtered
+    # --- end E.2 ---
+
+
+
 
 
 # A dataclass is a class that provides some useful defaults for you. If you define
@@ -721,86 +650,36 @@ class Item:
 
 
 def main():
-    
+    # Parse the command-line arguments
     args = parse_args()
-    logging.basicConfig(level=args.logging_level)
+    logging.basicConfig(level=args.logging_level) 
+
     grammar = Grammar(args.start_symbol, args.grammar)
 
     with open(args.sentences) as f:
-        for sentence in f:
+        for sentence in f.readlines():
             sentence = sentence.strip()
-            if not sentence:
-                continue
-
-            log.debug("=" * 70)
-            log.debug(f"Parsing sentence: {sentence}")
-
-            tokens = sentence.split()
-            """
-            maxcost = 5.0  # initial cutoff
-            best = None
-            while True:
-                log.info(f"Trying maxcost={maxcost} for: {sentence}")
-                # Optimization: vocab specialization
-                specialized_grammar = grammar.specialize(tokens)
-                chart = EarleyChart(tokens, specialized_grammar, progress=args.progress, maxcost=maxcost)
+            if sentence != "":  # skip blank lines
+                # analyze the sentence
+                log.debug("="*70)
+                log.debug(f"Parsing sentence: {sentence}")
+                
+                chart = EarleyChart(sentence.split(), grammar, progress=args.progress)
 
                 best = chart.best_root_item()
-                if best is not None:
-                    break
-                if maxcost > 320:
-                    break
-                maxcost *= 2  # widen maxcost gradually
-
-            if best is None:
-                print("NONE")
-            else:
-                item, cost = best
-                tree = chart._build_tree(item, end_col=len(tokens))
-                def show(t):
-                    if len(t) == 1:
-                        return t[0]
-                    return "(" + " ".join([t[0]] + [show(c) for c in t[1:]]) + ")"
-                print(show(tree))
-                print(cost)
-            """
-
-            maxcost = 5.0
-            best = None
-            chart = None
-            specialized_grammar = grammar.specialize(tokens)
-
-            while True:
-                log.info(f"Trying maxcost={maxcost} for: {sentence}")
-
-                # Reuse previous chart if possible
-                if chart is None:
-                    chart = EarleyChart(tokens, specialized_grammar, progress=args.progress, maxcost=maxcost)
+                if best is None:
+                    print("NONE")
                 else:
-                    # Re-run using the same grammar and existing chart state
-                    chart.maxcost = maxcost
-                    chart._run_earley()  # resumes parsing with higher cost allowance
+                    item, cost = best
+                    tree = chart._build_tree(item, end_col=len(sentence.split()))
 
-                best = chart.best_root_item()
-                if best is not None:
-                    break
-                if math.isinf(maxcost): #or maxcost >= 640:
-                    break
+                    def show(t):
+                        if len(t) == 1:
+                            return t[0]
+                        return "(" + " ".join([t[0]] + [show(c) for c in t[1:]]) + ")"
 
-                maxcost *= 2
-
-            if best is None:
-                print("NONE")
-            else:
-                item, cost = best
-                tree = chart._build_tree(item, end_col=len(tokens))
-                def show(t):
-                    if len(t) == 1:
-                        return t[0]
-                    return "(" + " ".join([t[0]] + [show(c) for c in t[1:]]) + ")"
-                print(show(tree))
-                print(cost)
-
+                    print(show(tree))
+                    print(cost)
 
 
     
