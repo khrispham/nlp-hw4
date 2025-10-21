@@ -1,0 +1,46 @@
+(ROOT (S (NP Joe) (VP (V (V love) -s) (NP Jill))) .)
+22.972163285712586
+(ROOT (S (NP he) (VP (V (V love) -s) (NP her))) .)
+22.972163285712586
+(ROOT (S (NP him) (VP (V (V love) -s) (NP she))) .)
+22.972163285712586
+(ROOT (S (NP Papa) (VP (VP (V (V sleep) -s)) (PP (P with) (NP (Det a) (N spoon))))) .)
+36.89093612242101
+(ROOT (S (NP Papa) (VP (VP (V (V eat) -ed)) (PP (P with) (NP (Det a) (N spoon))))) .)
+34.89093612242101
+(ROOT (S (NP Papa) (VP (V (V sleep) -s) (NP (Det every) (N (N bonbon) (PP (P with) (NP (Det a) (N spoon))))))) .)
+48.27366181637662
+(ROOT (S (NP Papa) (VP (V (V eat) -ed) (NP (Det every) (N (N bonbon) (PP (P with) (NP (Det a) (N spoon))))))) .)
+46.27366181637662
+(ROOT (VP (V have) (NP (Det a) (N bonbon))) !)
+20.97216328571259
+(ROOT (S (NP (Det a) (N (N bonbon) (PP (P on) (NP (Det the) (N spoon))))) (VP (V (V entice) -s))) .)
+42.56789042537615
+(ROOT (S (NP (Det a) (N (N bonbon) (PP (P on) (NP (Det the) (N spoon))))) (VP (V (V entice) -0))) .)
+42.56789042537615
+(ROOT (S (NP (Det the) (N (N (N bonbon) -s) (PP (P on) (NP (Det the) (N spoon))))) (VP (V (V entice) -0))) .)
+45.26386421755093
+(ROOT (S (NP Joe) (VP (V (V kiss) -ed) (NP (Det every) (N chief of staff)))) .)
+29.761075912013297
+(ROOT (S (NP Jill) (VP (VP (V (V say) -s) (CP that (S (NP Joe) (VP (Modal might) (VP (V sleep)))))) (PP (P on) (NP (Det the) (N floor))))) !)
+55.29081418034958
+(ROOT (S (NP (Det the) (N (Adj perplexed) (N president))) (VP (V (V eat) -ed) (NP (Det a) (N pickle)))) .)
+42.05187527837249
+(ROOT (S (NP Papa) (VP (V is) (Adj perplexed))) .)
+16.98916360729558
+(ROOT (S (NP Papa) (VP (V is) (N chief of staff))) .)
+17.884123250999505
+(ROOT (S (NP Papa) (VP (V (V want) -ed) (NP (Det a) (N sandwich)))) .)
+28.17611341129214
+(ROOT (S (NP Papa) (VP (V (V want) -ed) (VP (V to (V eat)) (NP (Det a) (N sandwich))))) .)
+38.8381975013513
+(ROOT (S (NP Papa) (VP (V (V want) -ed) (NP Joe) (VP (V to (V eat)) (NP (Det a) (N pickle))))) .)
+44.86099818782629
+(ROOT (S (NP Papa) (VP (V (V want) -ed) (NP (Det a) (N pickle)) (VP (V to (V eat)) (NP Joe)))) .)
+44.86099818782629
+(ROOT (S (NP Papa) (VP (Modal would) (VP (V have) (VP (V (V eat) -ed) (NP (Det his) (N (N sandwich) -s)))))) .)
+43.83902587505451
+(ROOT (S (NP (Det every) (N sandwich)) (VP (V was) (VP (V (V go) -ing) (VP (V to (V have)) (VP (V been) (Adj delicious)))))) .)
+53.67628846906069
+(ROOT (S (NP (NP (Det the) (N (Adj (Adj fine) and (Adj blue)) (N woman))) and (NP (Det every) (N man))) (VP (VP (VP (Modal must) (VP (V have) (VP (V (V eat) -ed) (NP (Det two) (N (N sandwich) -s))))) and (VP (V (V sleep) -ed))) (PP (P on) (NP (Det the) (N floor))))) .)
+112.34389867541996

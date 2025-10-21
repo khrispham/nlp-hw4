@@ -16,7 +16,10 @@ import tqdm
 from dataclasses import dataclass
 from pathlib import Path
 from collections import Counter
-from typing import Counter as CounterType, Iterable, List, Optional, Dict, Tuple
+from collections import defaultdict
+from typing import Counter as CounterType, Iterable, List, Optional, Dict, Tuple, Set
+
+
 
 log = logging.getLogger(Path(__file__).stem)  # For usage, see findsim.py in earlier assignment.
 
@@ -68,6 +71,10 @@ class EarleyChart:
         self.progress = progress
         self.profile: CounterType[str] = Counter()
 
+        # --- E.3 max_cost pruning: global constant ---
+        self._max_cost = 8.0    # Only process items within +8.0 cost of the best in their column
+        # --- end E.3 ---
+
         # Augmented start
         self._aug = "__START__"
 
@@ -82,10 +89,14 @@ class EarleyChart:
         # best full cost for a completed constituent
         self.best_complete: Dict[Tuple[str, int, int], float] = {}
 
-
-
-
         self.cols: List[Agenda]
+
+        # --- E.2 Vocabulary specialization: per-sentence active rule set ---
+        # Temporarily "delete" rules that contain terminals not appearing in this sentence.
+        self._expansions_active: Dict[str, List[Rule]] = self.grammar.specialize_to_sentence(self.tokens)
+        # --- end E.2 ---
+
+
         self._run_earley()    # run Earley's algorithm to construct self.cols
 
     # check final column for best parse (else return None)
@@ -183,6 +194,12 @@ class EarleyChart:
         # Initially empty column for each position in sentence
         self.cols = [Agenda() for _ in range(len(self.tokens) + 1)]
 
+        # --- E.1 Batch duplicate check: per-column sets ---
+        # For each column, remember which nonterminals we've already batch-predicted here.
+        # (Now it's safe because self.cols exists and has the final length.)
+        self._predicted_nonterminals: List[Set[str]] = [set() for _ in self.cols]
+        # --- end E.1 per-column sets ---
+
         # Seed: S' → · ROOT at column 0 (weight 0)
         aug_rule = Rule(self._aug, (self.grammar.start_symbol,), 0.0)
         start_item = Item(aug_rule, 0, 0)
@@ -216,12 +233,34 @@ class EarleyChart:
                     log.debug(f"{item} => SCAN")
                     self._scan(item, i)                      
 
+    # --- E.2 Vocabulary specialization: accessor for filtered expansions ---
+    def _expansions(self, lhs: str) -> Iterable["Rule"]:
+        return self._expansions_active.get(lhs, [])
+    # --- end E.2 ---
+
+
     def _predict(self, nonterminal: str, position: int) -> None:
-        for rule in self.grammar.expansions(nonterminal):
+        # --- E.1 Batch duplicate check: fast skip if we've already predicted this category in this column ---
+        if nonterminal in self._predicted_nonterminals[position]:
+            # We've already enqueued the whole batch of rules for this LHS at this column.
+            self.profile["PREDICT_BATCH_SKIPPED"] += 1
+            return
+        # First time we see this category in this column: mark and add the whole batch once.
+        self._predicted_nonterminals[position].add(nonterminal)
+        # --- end E.1 batch duplicate check ---
+        
+        # --- E.2 Vocabulary specialization: only rules whose terminals are in this sentence ---
+        any_rule = False
+        for rule in self._expansions(nonterminal):
+            any_rule = True
             new_item = Item(rule, dot_position=0, start_position=position)
             self._update_item(position, new_item, cand_cost=0.0)
             log.debug(f"\tPredicted: {new_item} in column {position}")
             self.profile["PREDICT"] += 1
+        if not any_rule:
+            self.profile["PREDICT_VOCAB_FILTER_SKIPPED"] += 1
+        # --- end E.2 ---
+
 
 
 
@@ -396,6 +435,32 @@ class Grammar:
     def is_nonterminal(self, symbol: str) -> bool:
         """Is symbol a nonterminal symbol?"""
         return symbol in self._expansions
+    
+    # --- E.2 Vocabulary specialization: build per-sentence filtered expansions ---
+    def specialize_to_sentence(self, tokens: List[str]) -> Dict[str, List["Rule"]]:
+        """
+        Return a mapping {lhs -> [Rule, ...]} where any rule that mentions a terminal
+        not present in `tokens` is removed. (Nonterminals are kept.)
+        """
+        vocab = set(tokens)
+        filtered: Dict[str, List[Rule]] = {}
+
+        for lhs, rules in self._expansions.items():
+            kept = []
+            for r in rules:
+                ok = True
+                for sym in r.rhs:
+                    # A terminal is any symbol that is not a known nonterminal in this grammar
+                    if sym not in self._expansions:   # terminal
+                        if sym not in vocab:
+                            ok = False
+                            break
+                if ok:
+                    kept.append(r)
+            filtered[lhs] = kept
+        return filtered
+    # --- end E.2 ---
+
 
 
 # A dataclass is a class that provides some useful defaults for you. If you define
